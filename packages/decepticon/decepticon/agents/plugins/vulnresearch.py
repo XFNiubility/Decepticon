@@ -63,7 +63,7 @@ from decepticon.agents.prompts import load_prompt
 from decepticon.backends import build_sandbox_backend, make_agent_backend
 from decepticon.core.subagent_streaming import StreamingRunnable
 from decepticon.llm import LLMFactory
-from decepticon.middleware.step_budget import StepBudgetMiddleware
+from decepticon.middleware.step_budget import StepBudgetMiddleware, effective_recursion_limit
 from decepticon_core.plugin_loader import (
     is_bundle_enabled,
     load_plugin_callbacks,
@@ -71,7 +71,7 @@ from decepticon_core.plugin_loader import (
 )
 
 _ROLE = "vulnresearch"
-_RECURSION_LIMIT = 1000
+_RECURSION_LIMIT = 2000  # issue #1145: raised from the per-role values (120-1000) — flash models loop in report phases; the env-tunable main budget is 2000 too
 
 # kg_query / kg_stats were removed pending the Neo4j middleware redesign
 # (see docs/design/neo4j-research-notes.md). KG surface is currently
@@ -202,7 +202,7 @@ def create_vulnresearch_agent(
         name=_ROLE,
     ).with_config(
         {
-            "recursion_limit": recursion_limit or _RECURSION_LIMIT,
+            "recursion_limit": effective_recursion_limit(recursion_limit or _RECURSION_LIMIT),
             "callbacks": load_plugin_callbacks(role=_ROLE, backend=backend),
         }
     )

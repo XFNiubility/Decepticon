@@ -17,13 +17,17 @@ from typing import Any, Protocol
 
 import httpx
 
-from decepticon.backends.http_sandbox import (
-    HTTPSandbox,
+from decepticon.backends.daemon_client import (
+    SandboxDaemonClient,
     SandboxError,
     _mirror_key,
     _normalize_workspace,
 )
-from decepticon.sandbox_server.session_client import MAX_MESSAGE_BYTES, SESSION_PATHS
+from decepticon.sandbox_server.session_client import (
+    MANAGED_BRIDGE,
+    MAX_MESSAGE_BYTES,
+    SESSION_PATHS,
+)
 
 
 class OpenShellSession(Protocol):
@@ -54,7 +58,7 @@ class OpenShellAdmission:
     ready: bool
 
 
-class OpenShellSandbox(HTTPSandbox):
+class OpenShellSandbox(SandboxDaemonClient):
     """Reuse wire serialization/job bookkeeping, replacing the entire transport.
 
     current_admission must consult trusted host state, including revocation,
@@ -70,18 +74,29 @@ class OpenShellSandbox(HTTPSandbox):
         *,
         admission: OpenShellAdmission,
         current_admission: Callable[[], OpenShellAdmission],
+        renew_admission: Callable[[], OpenShellAdmission] | None = None,
         timeout: float = 120,
     ) -> None:
-        super().__init__("http://127.0.0.1:9999", timeout=timeout)
+        super().__init__(timeout=timeout)
         self._session = session
         self._admission = admission
         self._current_admission = current_admission
+        self._renew_admission = renew_admission
         self._closed = False
         self.check_admission()
 
     @property
     def id(self) -> str:
         return f"openshell:{self._admission.sandbox_id}:{self._admission.runtime_generation}"
+
+    def current_admission(self) -> OpenShellAdmission:
+        """The trusted host's current admission receipt for this binding.
+
+        Provisioning verification reads this instead of the construction
+        receipt so a revoked or policy-swapped binding is caught at
+        provisioning time, not only at the next execution.
+        """
+        return self._current_admission()
 
     def check_admission(self) -> None:
         expected = self._admission
@@ -102,18 +117,36 @@ class OpenShellSandbox(HTTPSandbox):
             or not math.isfinite(expected.expires_at)
             or time.time() >= expected.expires_at
         ):
-            raise SandboxError("OpenShell execution admission is not ready or has expired")
+            # The runtime identity is unchanged (the equality check above
+            # passed); only the receipt TTL ran out — a long-lived daemon
+            # hits this on every request after the host's admission window
+            # passes. Renew through the trusted host (which re-verifies the
+            # approved RoE hash and the live runtime) instead of discarding
+            # the run. A revoked/changed binding still fails closed above.
+            renewed = self._renew()
+            if renewed is not None:
+                expected = self._admission
+            if (
+                not expected.ready
+                or not math.isfinite(expected.expires_at)
+                or time.time() >= expected.expires_at
+            ):
+                raise SandboxError("OpenShell execution admission is not ready or has expired")
         if self._session.id != expected.sandbox_id:
             raise SandboxError("OpenShell session does not match the admitted sandbox")
+
+    def _renew(self) -> OpenShellAdmission | None:
+        """Re-read the receipt through the trusted host; None if unsupported."""
+        if self._renew_admission is None:
+            return None
+        self._admission = self._renew_admission()
+        return self._admission
 
     def _http(self) -> httpx.Client:
         raise SandboxError("Direct daemon HTTP is disabled for OpenShell")
 
     def close(self) -> None:
         self._closed = True
-
-    def provision_egress(self, policy: Any) -> dict:
-        raise SandboxError("OpenShell policy must be installed by the trusted control plane")
 
     def _request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
         self.check_admission()
@@ -138,7 +171,7 @@ class OpenShellSandbox(HTTPSandbox):
             raise SandboxError("OpenShell session request too large")
         # No automatic retry: a failed stream may already have run a mutation.
         result = self._session.exec(
-            ["/usr/bin/python3", "/opt/decepticon/sandbox_server/session_client.py"],
+            ["/usr/bin/python3", "-I", MANAGED_BRIDGE],
             stdin=wire,
             timeout_seconds=math.ceil(timeout) + 10,
             no_login_shell=True,

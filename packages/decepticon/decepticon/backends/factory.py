@@ -2,7 +2,7 @@
 
 The agent code shouldn't know how the sandbox is deployed; it just asks
 for a sandbox object. ``build_sandbox_backend()`` returns an
-``HTTPSandbox`` that talks to a sandbox daemon over HTTP, which works in
+``HTTPTransportSandbox`` that talks to a sandbox daemon over HTTP, which works in
 every deployment target Decepticon supports today:
 
   - Dev / local-docker: sandbox container exposes the FastAPI daemon
@@ -28,14 +28,33 @@ import os
 from collections.abc import Callable
 from typing import Any
 
-from decepticon.backends.http_sandbox import HTTPSandbox
+from deepagents.backends.protocol import (
+    FileDownloadResponse,
+    GlobResult,
+    GrepResult,
+    LsResult,
+    ReadResult,
+)
+
+from decepticon.backends.http_transport import HTTPTransportSandbox
 
 _DEFAULT_SANDBOX_URL = "http://localhost:9999"
-_openshell_resolver: Callable[[Any], HTTPSandbox] | None = None
+_openshell_resolver: Callable[[Any], HTTPTransportSandbox] | None = None
 
 
-class _UnboundOpenShellSandbox(HTTPSandbox):
-    """A graph-construction placeholder; it can never perform an operation."""
+class _UnboundOpenShellSandbox(HTTPTransportSandbox):
+    """A graph-construction placeholder; it can never perform an operation.
+
+    Read-class operations are the one carve-out: before a scope is imported
+    the workspace is simply empty, so reads report not-found / empty results
+    instead of raising — graph-construction-time hooks (OPPLAN load,
+    engagement markers) then see an empty workspace and the operator journey
+    reaches ``/scope import``. Note ``HTTPTransportSandbox.read`` is execute-based
+    (the sandbox daemon reads files with a script), so these overrides are
+    implemented directly and never touch the transport. Every other
+    operation stays loud: without an admitted binding there is no kernel
+    boundary to execute anything behind.
+    """
 
     egress_authority = "openshell"
 
@@ -52,8 +71,32 @@ class _UnboundOpenShellSandbox(HTTPSandbox):
     def _request(self, method: str, path: str, **kwargs: Any):
         raise RuntimeError("OpenShell run binding is required before execution")
 
+    def download_files(self, paths: list[str]) -> list[FileDownloadResponse]:
+        # Pre-admission the workspace is empty: every requested path reports
+        # the daemon's own not-found convention instead of raising.
+        return [FileDownloadResponse(path=p, content=None, error="file_not_found") for p in paths]
 
-def configure_openshell_resolver(resolver: Callable[[Any], HTTPSandbox] | None) -> None:
+    def read(self, file_path: str, offset: int = 0, limit: int = 2000) -> ReadResult:
+        return ReadResult(error=f"File '{file_path}': file_not_found")
+
+    def ls(self, path: str) -> LsResult:
+        return LsResult(error=None, entries=[])
+
+    def glob(self, pattern: str, path: str | None = None) -> GlobResult:
+        return GlobResult(error=None, matches=[], truncated=False, truncation_reason=None)
+
+    def grep(
+        self,
+        pattern: str,
+        path: str | None = None,
+        glob: str | None = None,
+        *,
+        max_count: int | None = None,
+    ) -> GrepResult:
+        return GrepResult(error=None, matches=[], truncated=False)
+
+
+def configure_openshell_resolver(resolver: Callable[[Any], HTTPTransportSandbox] | None) -> None:
     """Install a TRUSTED host resolver, never one supplied by agent config.
 
     It must authenticate owner/run/custody, resolve the opaque binding reference
@@ -83,8 +126,8 @@ def _run_config(config: Any = None) -> dict:
 # under-sizing would evict a live engagement's client mid-flight. 128 covers
 # realistic per-process concurrency with headroom.
 @functools.lru_cache(maxsize=128)
-def _shared_sandbox(base_url: str, token: str | None) -> HTTPSandbox:
-    return HTTPSandbox(base_url=base_url, token=token)
+def _shared_sandbox(base_url: str, token: str | None) -> HTTPTransportSandbox:
+    return HTTPTransportSandbox(base_url=base_url, token=token)
 
 
 def _endpoint_from_configurable(configurable: Any) -> tuple[str | None, str | None]:
@@ -143,7 +186,7 @@ def _resolve_endpoint(config: Any = None) -> tuple[str, str | None]:
     return url, token
 
 
-def build_sandbox_backend(config: Any = None) -> HTTPSandbox:
+def build_sandbox_backend(config: Any = None) -> HTTPTransportSandbox:
     """Build the HTTP-transport sandbox backend.
 
     ``config`` — an optional run ``RunnableConfig``. When provided its
@@ -154,7 +197,7 @@ def build_sandbox_backend(config: Any = None) -> HTTPSandbox:
     per-engagement sandbox even inside a sub-agent, where the contextvar is not
     seeded.
 
-    Returns the same ``HTTPSandbox`` instance for every call with the
+    Returns the same ``HTTPTransportSandbox`` instance for every call with the
     same ``(base_url, token)``. langgraph dev server invokes one factory
     per registered graph at startup; without a shared client each
     factory builds its own client + its own ``BackgroundJobTracker``,
@@ -170,7 +213,7 @@ def build_sandbox_backend(config: Any = None) -> HTTPSandbox:
     present; otherwise ``SANDBOX_URL`` / ``SANDBOX_TOKEN`` apply.
 
     Returns:
-        An ``HTTPSandbox`` instance pointed at the daemon URL.
+        An ``HTTPTransportSandbox`` instance pointed at the daemon URL.
 
     Env:
         SANDBOX_URL
@@ -183,20 +226,48 @@ def build_sandbox_backend(config: Any = None) -> HTTPSandbox:
     """
     run_config = _run_config(config)
     configurable = run_config.get("configurable", {})
-    host_provider = os.environ.get("DECEPTICON_SANDBOX_PROVIDER", "").strip()
-    if host_provider not in ("", "http", "openshell"):
+    # OpenShell is the only network-boundary authority since the nftables
+    # retirement (#1144): the default provider is openshell. HTTP remains an
+    # EXPLICIT escape hatch for non-engagement contexts (tests, benchmarks,
+    # pre-scope file ops) — under a materialized RoE the RoE middleware still
+    # refuses it loudly, by design.
+    host_provider = (
+        os.environ.get("DECEPTICON_SANDBOX_PROVIDER", "openshell").strip() or "openshell"
+    )
+    if host_provider not in ("http", "openshell"):
         raise RuntimeError("Unsupported host sandbox provider")
     requested = configurable.get("sandbox_provider") if isinstance(configurable, dict) else None
     if host_provider == "openshell" and requested not in (None, "openshell"):
         raise RuntimeError("Host requires OpenShell; provider downgrade is disabled")
     if host_provider == "openshell" or requested == "openshell":
         if _openshell_resolver is None:
+            # The operator's explicit env opt-in is what makes the local
+            # resolver trusted — agent config can never install one.
+            from decepticon.backends.openshell_local import maybe_install_local_resolver
+
+            maybe_install_local_resolver()
+        if _openshell_resolver is None:
             raise RuntimeError("OpenShell provider requires a trusted host admission resolver")
         if not run_config:
             return _UnboundOpenShellSandbox()
         from decepticon.backends.openshell_sandbox import OpenShellSandbox
 
-        backend = _openshell_resolver(run_config)
+        try:
+            backend = _openshell_resolver(run_config)
+        except RuntimeError as exc:
+            # First-run journey (observed on the OSS verification stack):
+            # graph construction runs before any engagement scope exists, and
+            # the binding refuses to admit a workspace without a materialized
+            # plan/roe.json. Booting must not crash-loop on that — an
+            # unbound placeholder keeps the daemon up, the RoE guard fails
+            # loudly if a run is attempted before /scope import, and the
+            # binding resolves for real once the operator imports a scope.
+            # A real run (has a thread_id) still fails loudly.
+            if "materialized plan/roe.json" in str(exc) and not (
+                isinstance(configurable, dict) and configurable.get("thread_id")
+            ):
+                return _UnboundOpenShellSandbox()
+            raise
         if not isinstance(backend, OpenShellSandbox):
             raise RuntimeError("OpenShell resolver did not return an admitted OpenShell backend")
         backend.check_admission()
